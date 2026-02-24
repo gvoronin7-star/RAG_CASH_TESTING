@@ -1,249 +1,224 @@
 """
-Модуль для работы с эмбеддингами и векторным хранилищем ChromaDB.
+Модуль для работы с эмбеддингами и векторным хранилищем FAISS.
 
 Здесь мы создаем векторные представления текстов используя OpenAI API
-и сохраняем их в ChromaDB для быстрого семантического поиска.
+и сохраняем их в FAISS для быстрого семантического поиска.
 """
 
-import chromadb
-from chromadb.config import Settings
+import faiss
+import numpy as np
 from openai import OpenAI
 from typing import List, Tuple
 import os
+import pickle
 
 
 class EmbeddingStore:
     """
-    Класс для работы с векторным хранилищем ChromaDB.
+    Класс для работы с векторным хранилищем FAISS.
     
     Использует OpenAI API для создания эмбеддингов
-    и ChromaDB для их хранения и поиска.
+    и FAISS для их хранения и поиска.
     """
+    
+    # Размерность для модели text-embedding-3-small
+    EMBEDDING_DIMENSIONS = {
+        "text-embedding-3-small": 1536,
+        "text-embedding-3-large": 3072,
+        "text-embedding-ada-002": 1536,
+    }
     
     def __init__(
         self, 
         collection_name: str = "documents",
-        persist_directory: str = "./chroma_db",
+        persist_directory: str = "./faiss_db",
         embedding_model: str = "text-embedding-3-small",
-        api_key: str = None
+        api_key: str = None,
+        base_url: str = "https://openai.api.proxyapi.ru/v1"
     ):
         """
         Инициализация хранилища эмбеддингов.
         
         Args:
-            collection_name: Имя коллекции в ChromaDB
-            persist_directory: Директория для сохранения данных ChromaDB
+            collection_name: Имя коллекции (используется для именования файлов)
+            persist_directory: Директория для сохранения данных FAISS
             embedding_model: Название модели OpenAI для эмбеддингов
             api_key: API ключ OpenAI (если None, берется из переменной окружения)
+            base_url: URL прокси для OpenAI API
         """
-        print(f"Инициализация ChromaDB в директории: {persist_directory}")
-        
-        # Создаем клиент ChromaDB с персистентным хранилищем
-        # Данные будут сохраняться на диск и загружаться при перезапуске
-        self.client = chromadb.PersistentClient(
-            path=persist_directory,
-            settings=Settings(
-                anonymized_telemetry=False  # Отключаем телеметрию
-            )
-        )
-        
-        # Инициализируем клиент OpenAI для создания эмбеддингов
-        # API ключ берется из параметра или переменной окружения OPENAI_API_KEY
-        self.openai_client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
+        self.persist_directory = persist_directory
+        self.collection_name = collection_name
         self.embedding_model = embedding_model
         
-        print(f"Модель эмбеддингов: {embedding_model} (OpenAI API)")
-        
-        # Получаем или создаем коллекцию в ChromaDB
-        self.collection = self.client.get_or_create_collection(
-            name=collection_name,
-            metadata={"description": "Документы для RAG-ассистента"}
+        # Определяем размерность эмбеддингов
+        self.embedding_dim = self.EMBEDDING_DIMENSIONS.get(
+            embedding_model, 
+            self.EMBEDDING_DIMENSIONS["text-embedding-3-small"]
         )
         
-        print(f"✓ ChromaDB инициализирована. Документов в коллекции: {self.collection.count()}")
+        print(f"FAISS init in directory: {persist_directory}")
+        
+        # Создаем директорию если не существует
+        os.makedirs(persist_directory, exist_ok=True)
+        
+        # Инициализируем клиент OpenAI для создания эмбеддингов
+        self.openai_client = OpenAI(
+            api_key=api_key or os.getenv("OPENAI_API_KEY"),
+            base_url=base_url
+        )
+        
+        print(f"Model: {embedding_model} (dimension: {self.embedding_dim})")
+        
+        # Загружаем или создаем индекс FAISS
+        self._load_or_create_index()
+        
+        print(f"OK. FAISS initialized. Documents: {self.ntotal}")
+    
+    def _load_or_create_index(self) -> None:
+        """Загружает существующий индекс или создает новый."""
+        index_path = os.path.join(self.persist_directory, f"{self.collection_name}_index.faiss")
+        metadata_path = os.path.join(self.persist_directory, f"{self.collection_name}_metadata.pkl")
+        
+        if os.path.exists(index_path) and os.path.exists(metadata_path):
+            # Загружаем существующий индекс
+            self.index = faiss.read_index(index_path)
+            with open(metadata_path, 'rb') as f:
+                metadata = pickle.load(f)
+                self.documents = metadata.get('documents', [])
+                self.sources = metadata.get('sources', [])
+        else:
+            # Создаем новый индекс
+            # Используем IndexFlatIP для косинусного сходства (после нормализации)
+            self.index = faiss.IndexFlatIP(self.embedding_dim)
+            self.documents = []
+            self.sources = []
+    
+    def _save_index(self) -> None:
+        """Сохраняет индекс на диск."""
+        index_path = os.path.join(self.persist_directory, f"{self.collection_name}_index.faiss")
+        metadata_path = os.path.join(self.persist_directory, f"{self.collection_name}_metadata.pkl")
+        
+        faiss.write_index(self.index, index_path)
+        
+        metadata = {
+            'documents': self.documents,
+            'sources': self.sources
+        }
+        with open(metadata_path, 'wb') as f:
+            pickle.dump(metadata, f)
+    
+    @property
+    def ntotal(self) -> int:
+        """Возвращает количество документов в индексе."""
+        return self.index.ntotal
     
     def _create_chunks(self, text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
-        """
-        Разбивает текст на чанки (фрагменты) с перекрытием.
-        
-        Перекрытие важно, чтобы не потерять контекст на границах чанков.
-        
-        Args:
-            text: Исходный текст
-            chunk_size: Размер чанка в символах
-            overlap: Размер перекрытия между чанками
-            
-        Returns:
-            Список чанков текста
-        """
+        """Разбивает текст на чанки (фрагменты) с перекрытием."""
         chunks = []
         start = 0
         
         while start < len(text):
-            # Вычисляем конец текущего чанка
             end = start + chunk_size
-            
-            # Добавляем чанк в список
             chunk = text[start:end].strip()
-            if chunk:  # Пропускаем пустые чанки
+            if chunk:
                 chunks.append(chunk)
-            
-            # Сдвигаемся вперед с учетом перекрытия
             start = end - overlap
         
         return chunks
     
     def _create_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """
-        Создает эмбеддинги для списка текстов используя OpenAI API.
-        
-        Args:
-            texts: Список текстов для создания эмбеддингов
-            
-        Returns:
-            Список векторов эмбеддингов
-        """
+        """Создает эмбеддинги для списка текстов используя OpenAI API."""
         try:
-            # Отправляем запрос к OpenAI API для создания эмбеддингов
-            # API автоматически обрабатывает батчи текстов
             response = self.openai_client.embeddings.create(
                 model=self.embedding_model,
                 input=texts,
-                encoding_format="float"  # Получаем векторы в формате float
+                encoding_format="float"
             )
-            
-            # Извлекаем векторы эмбеддингов из ответа
             embeddings = [item.embedding for item in response.data]
-            
             return embeddings
-            
         except Exception as e:
-            print(f"❌ Ошибка при создании эмбеддингов: {str(e)}")
+            print(f"Error: {str(e)}")
             raise
     
     def add_documents(self, documents: List[Tuple[str, str]]) -> None:
-        """
-        Добавляет документы в векторное хранилище.
-        
-        Каждый документ разбивается на чанки, для каждого чанка создается
-        эмбеддинг через OpenAI API, и все сохраняется в ChromaDB.
-        
-        Args:
-            documents: Список кортежей (название_документа, текст_документа)
-        """
+        """Добавляет документы в векторное хранилище."""
         all_chunks = []
-        all_metadatas = []
-        all_ids = []
+        all_sources = []
         
-        chunk_id = self.collection.count()  # Начинаем нумерацию с текущего количества
-        
-        print(f"\nДобавление {len(documents)} документов в ChromaDB...")
+        print(f"\nAdding {len(documents)} documents to FAISS...")
         
         for doc_name, doc_text in documents:
-            # Разбиваем документ на чанки
             chunks = self._create_chunks(doc_text)
-            
-            print(f"  • {doc_name}: {len(chunks)} чанков")
+            print(f"  - {doc_name}: {len(chunks)} chunks")
             
             for chunk in chunks:
                 all_chunks.append(chunk)
-                all_metadatas.append({
-                    "source": doc_name,
-                    "chunk_length": len(chunk)
-                })
-                all_ids.append(f"chunk_{chunk_id}")
-                chunk_id += 1
+                all_sources.append(doc_name)
         
-        # Создаем эмбеддинги через OpenAI API
-        print(f"\nСоздание эмбеддингов для {len(all_chunks)} чанков через OpenAI API...")
-        print(f"(Модель: {self.embedding_model})")
+        print(f"\nCreating embeddings for {len(all_chunks)} chunks via OpenAI API...")
         
-        # OpenAI API имеет ограничение на размер батча, поэтому обрабатываем по частям
-        batch_size = 100  # Максимум 100 текстов за раз для безопасности
+        batch_size = 100
         all_embeddings = []
         
         for i in range(0, len(all_chunks), batch_size):
             batch = all_chunks[i:i + batch_size]
-            print(f"  Обработка чанков {i+1}-{min(i+batch_size, len(all_chunks))} из {len(all_chunks)}...")
+            print(f"  Processing chunks {i+1}-{min(i+batch_size, len(all_chunks))} of {len(all_chunks)}...")
             
             batch_embeddings = self._create_embeddings(batch)
             all_embeddings.extend(batch_embeddings)
         
-        # Добавляем все данные в ChromaDB одним батчем
-        print("Сохранение в ChromaDB...")
-        self.collection.add(
-            embeddings=all_embeddings,
-            documents=all_chunks,
-            metadatas=all_metadatas,
-            ids=all_ids
-        )
+        # Нормализуем векторы для косинусного сходства
+        embeddings_array = np.array(all_embeddings, dtype='float32')
+        faiss.normalize_L2(embeddings_array)
         
-        print(f"✓ Добавлено {len(all_chunks)} чанков. Всего в базе: {self.collection.count()}")
+        # Добавляем в индекс
+        self.index.add(embeddings_array)
+        self.documents.extend(all_chunks)
+        self.sources.extend(all_sources)
+        
+        # Сохраняем на диск
+        self._save_index()
+        
+        print(f"OK. Added {len(all_chunks)} chunks. Total: {self.ntotal}")
     
     def search(self, query: str, top_k: int = 3) -> List[Tuple[str, str, float]]:
-        """
-        Выполняет семантический поиск по векторному хранилищу.
-        
-        Находит top_k наиболее релевантных чанков для запроса.
-        
-        Args:
-            query: Поисковый запрос пользователя
-            top_k: Количество результатов для возврата
-            
-        Returns:
-            Список кортежей (текст_чанка, источник, расстояние)
-            Расстояние: чем меньше, тем более релевантен результат
-        """
-        # Проверяем, есть ли документы в коллекции
-        if self.collection.count() == 0:
-            print("⚠ Предупреждение: коллекция пуста, нет документов для поиска")
+        """Выполняет семантический поиск по векторному хранилищу."""
+        if self.ntotal == 0:
+            print("WARNING: Database is empty, no documents for search")
             return []
         
-        # Создаем эмбеддинг для запроса через OpenAI API
+        # Создаем эмбеддинг для запроса
         query_embeddings = self._create_embeddings([query])
-        query_embedding = query_embeddings[0]
+        query_vector = np.array([query_embeddings[0]], dtype='float32')
+        faiss.normalize_L2(query_vector)
         
-        # Выполняем поиск в ChromaDB
-        results = self.collection.query(
-            query_embeddings=[query_embedding],
-            n_results=min(top_k, self.collection.count())
-        )
+        # Выполняем поиск
+        k = min(top_k, self.ntotal)
+        distances, indices = self.index.search(query_vector, k)
         
         # Форматируем результаты
         formatted_results = []
-        
-        if results['documents'] and len(results['documents'][0]) > 0:
-            for i in range(len(results['documents'][0])):
-                chunk_text = results['documents'][0][i]
-                source = results['metadatas'][0][i]['source']
-                distance = results['distances'][0][i]
-                
+        for i in range(k):
+            idx = indices[0][i]
+            if idx >= 0:
+                chunk_text = self.documents[idx]
+                source = self.sources[idx]
+                distance = float(distances[0][i])
                 formatted_results.append((chunk_text, source, distance))
         
         return formatted_results
     
     def clear_collection(self) -> None:
-        """
-        Очищает коллекцию (удаляет все документы).
-        """
-        # Удаляем коллекцию и создаем заново
-        self.client.delete_collection(self.collection.name)
-        self.collection = self.client.get_or_create_collection(
-            name=self.collection.name,
-            metadata={"description": "Документы для RAG-ассистента"}
-        )
-        print("✓ Коллекция очищена")
+        """Очищает коллекцию (удаляет все документы)."""
+        self.index.reset()
+        self.documents = []
+        self.sources = []
+        self._save_index()
+        print("OK. Collection cleared")
 
 
 def get_sample_documents() -> List[Tuple[str, str]]:
-    """
-    Возвращает примеры документов для демонстрации RAG.
-    
-    В реальном проекте документы загружались бы из файлов или базы данных.
-    
-    Returns:
-        Список кортежей (название, текст)
-    """
+    """Возвращает примеры документов для демонстрации RAG."""
     documents = [
         (
             "Python Основы",
@@ -253,8 +228,7 @@ def get_sample_documents() -> List[Tuple[str, str]]:
             
             Python известен своей простотой и читаемостью кода. Философия языка 
             подчеркивает важность читаемости кода и позволяет программистам 
-            выражать концепции в меньшем количестве строк кода, чем это было бы 
-            возможно в других языках.
+            выражать концепции в меньшем количестве строк кода.
             
             Основные возможности Python включают:
             - Динамическую типизацию
@@ -276,22 +250,16 @@ def get_sample_documents() -> List[Tuple[str, str]]:
             Основные типы машинного обучения:
             
             1. Обучение с учителем (Supervised Learning)
-            В этом подходе модель обучается на размеченных данных, где каждый 
-            пример имеет известный правильный ответ. Примеры: классификация 
-            изображений, предсказание цен на недвижимость.
+            В этом подходе модель обучается на размеченных данных.
             
             2. Обучение без учителя (Unsupervised Learning)
-            Модель ищет закономерности в неразмеченных данных. Примеры: 
-            кластеризация клиентов, обнаружение аномалий.
+            Модель ищет закономерности в неразмеченных данных.
             
             3. Обучение с подкреплением (Reinforcement Learning)
-            Агент обучается принимать решения, взаимодействуя со средой и 
-            получая награды или штрафы.
+            Агент обучается принимать решения, взаимодействуя со средой.
             
             RAG (Retrieval-Augmented Generation) - это техника, которая улучшает 
-            качество ответов языковых моделей, дополняя их внешними знаниями из 
-            базы данных. Это позволяет модели давать более точные и актуальные 
-            ответы, основанные на конкретных документах.
+            качество ответов языковых моделей, дополняя их внешними знаниями.
             """
         ),
         (
@@ -301,28 +269,24 @@ def get_sample_documents() -> List[Tuple[str, str]]:
             оптимизированные для хранения и поиска векторных эмбеддингов.
             
             Что такое эмбеддинги?
-            Эмбеддинги - это векторные представления данных (текста, изображений, 
-            аудио) в многомерном пространстве. Семантически похожие объекты 
-            располагаются близко друг к другу в этом пространстве.
+            Эмбеддинги - это векторные представления данных в многомерном пространстве.
+            Семантически похожие объекты располагаются близко друг к другу.
             
-            ChromaDB - это открытая векторная база данных, разработанная специально 
-            для работы с эмбеддингами в приложениях с искусственным интеллектом.
+            FAISS (Facebook AI Similarity Search) - это библиотека для эффективного 
+            поиска схожих векторов, разработанная Facebook Research.
             
-            Преимущества ChromaDB:
-            - Простота использования и встраивания в приложения
-            - Поддержка персистентного хранения данных
-            - Встроенная поддержка различных моделей эмбеддингов
-            - Быстрый семантический поиск
-            - Возможность работы как локально, так и в клиент-серверном режиме
+            Преимущества FAISS:
+            - Высокая скорость поиска
+            - Поддержка различных алгоритмов индексации
+            - Работа с большими объемами данных
+            - Эффективное использование памяти
             
             Векторные базы данных критически важны для RAG-систем, так как они 
             позволяют быстро находить релевантные документы на основе семантического 
             сходства запроса с содержимым базы данных.
             
             OpenAI предоставляет мощные модели для создания эмбеддингов, такие как 
-            text-embedding-3-small и text-embedding-3-large. Эти модели создают 
-            высококачественные векторные представления текста, которые отлично 
-            работают для семантического поиска в различных языках, включая русский.
+            text-embedding-3-small и text-embedding-3-large.
             """
         )
     ]

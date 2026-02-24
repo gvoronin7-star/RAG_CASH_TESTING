@@ -1,14 +1,15 @@
 """
-Главный файл для запуска RAG-ассистента.
+Main file for running RAG-assistant.
 
-Это точка входа в приложение. Здесь происходит:
-1. Загрузка конфигурации
-2. Инициализация всех компонентов (кеш, векторная база, RAG)
-3. Добавление примеров документов (при первом запуске)
-4. Интерактивный цикл общения с пользователем
+This is the entry point to the application. It does:
+1. Load configuration
+2. Initialize all components (cache, vector DB, RAG)
+3. Add sample documents (on first run)
+4. Interactive chat loop with user
 """
 
 import os
+import time
 from dotenv import load_dotenv
 from embeddings import EmbeddingStore, get_sample_documents
 from rag import RAGAssistant
@@ -17,57 +18,60 @@ from cache import ResponseCache
 
 def initialize_system():
     """
-    Инициализирует все компоненты RAG-системы.
+    Initialize all RAG system components.
     
     Returns:
-        Кортеж (embedding_store, rag_assistant, cache)
+        Tuple (embedding_store, rag_assistant, cache)
     """
     print("=" * 70)
-    print("🚀 ИНИЦИАЛИЗАЦИЯ RAG-АССИСТЕНТА")
+    print("[INIT] INITIALIZING RAG-ASSISTANT")
     print("=" * 70)
     
-    # Загружаем переменные окружения из .env файла
+    # Load environment variables from .env file
     load_dotenv()
     
-    # Проверяем наличие API ключа OpenAI
+    # Check for OpenAI API key
     api_key = os.getenv("OPENAI_API_KEY")
+    base_url = os.getenv("OPENAI_BASE_URL", "https://openai.api.proxyapi.ru/v1")
     if not api_key:
-        print("⚠️  ВНИМАНИЕ: Не найден OPENAI_API_KEY в переменных окружения!")
-        print("   Создайте файл .env и добавьте туда: OPENAI_API_KEY=your_key_here")
-        print("   Или установите переменную окружения в системе.")
+        print("[WARN] OPENAI_API_KEY not found in environment variables!")
+        print("   Create .env file and add: OPENAI_API_KEY=your_key_here")
+        print("   Or set environment variable in system.")
         print()
     
-    # 1. Инициализируем кеш для хранения ответов
-    print("\n[1/3] Инициализация кеша...")
+    # 1. Initialize cache for storing responses
+    print("\n[1/3] Initializing cache...")
     cache = ResponseCache(cache_file="cache.json")
     
-    # 2. Инициализируем векторное хранилище ChromaDB
-    print("\n[2/3] Инициализация векторного хранилища...")
+    # 2. Initialize FAISS vector store
+    print("\n[2/3] Initializing vector store...")
     embedding_store = EmbeddingStore(
         collection_name="rag_documents",
-        persist_directory="./chroma_db",
-        embedding_model="text-embedding-3-small",  # Модель OpenAI для эмбеддингов
-        api_key=api_key
+        persist_directory="./faiss_db",
+        embedding_model="text-embedding-3-small",
+        api_key=api_key,
+        base_url=base_url
     )
     
-    # Проверяем, нужно ли добавить примеры документов
-    if embedding_store.collection.count() == 0:
-        print("\n📝 База данных пуста. Добавляем примеры документов...")
+    # Check if we need to add sample documents
+    if embedding_store.ntotal == 0:
+        print("\n[DOC] Database is empty. Adding sample documents...")
         sample_docs = get_sample_documents()
         embedding_store.add_documents(sample_docs)
     else:
-        print(f"✓ В базе уже есть {embedding_store.collection.count()} документов")
+        print(f"[OK] Database already has {embedding_store.ntotal} documents")
     
-    # 3. Инициализируем RAG-ассистента
-    print("\n[3/3] Инициализация RAG-ассистента...")
+    # 3. Initialize RAG assistant
+    print("\n[3/3] Initializing RAG assistant...")
     rag_assistant = RAGAssistant(
         embedding_store=embedding_store,
         model="gpt-3.5-turbo",
-        temperature=0.7
+        temperature=0.7,
+        base_url=base_url
     )
     
     print("\n" + "=" * 70)
-    print("✅ СИСТЕМА ГОТОВА К РАБОТЕ")
+    print("[OK] SYSTEM READY")
     print("=" * 70)
     
     return embedding_store, rag_assistant, cache
@@ -75,40 +79,45 @@ def initialize_system():
 
 def answer_question(query: str, rag_assistant: RAGAssistant, cache: ResponseCache) -> str:
     """
-    Отвечает на вопрос пользователя с использованием кеша и RAG.
+    Answer user question using cache and RAG.
     
-    Логика работы:
-    1. Проверяем кеш - если ответ есть, возвращаем его
-    2. Если ответа нет, выполняем RAG (поиск + генерация)
-    3. Сохраняем новый ответ в кеш
-    4. Возвращаем ответ
+    Logic:
+    1. Check cache - if answer exists, return it
+    2. If not, perform RAG (search + generation)
+    3. Save new answer to cache
+    4. Return answer
     
     Args:
-        query: Вопрос пользователя
-        rag_assistant: Экземпляр RAG-ассистента
-        cache: Экземпляр кеша
+        query: User question
+        rag_assistant: RAG assistant instance
+        cache: Cache instance
         
     Returns:
-        Ответ на вопрос
+        Answer to question
     """
     print("\n" + "=" * 70)
-    print(f"❓ ВОПРОС: {query}")
+    print(f"[QUESTION] {query}")
     print("=" * 70)
     
-    # Шаг 1: Проверяем кеш
-    print("\n[Шаг 1] Проверка кеша...")
+    # Start timing
+    start_time = time.time()
+    
+    # Step 1: Check cache
+    print("\n[Step 1] Checking cache...")
     cached_answer = cache.get(query)
     
     if cached_answer:
-        # Ответ найден в кеше - возвращаем его
-        print("\n💾 Ответ из кеша:")
+        # Answer found in cache - return it
+        elapsed = time.time() - start_time
+        print(f"\n[TIME] Response time: {elapsed:.3f} seconds (from cache)")
+        print("\n[CACHE] Answer from cache:")
         print("-" * 70)
         print(cached_answer)
         print("-" * 70)
         return cached_answer
     
-    # Шаг 2: Ответа нет в кеше - выполняем RAG
-    print("\n[Шаг 2] Выполнение RAG (поиск + генерация)...")
+    # Step 2: Not in cache - perform RAG
+    print("\n[Step 2] Performing RAG (search + generation)...")
     
     try:
         answer, search_results = rag_assistant.generate_response(
@@ -117,12 +126,16 @@ def answer_question(query: str, rag_assistant: RAGAssistant, cache: ResponseCach
             verbose=True
         )
         
-        # Шаг 3: Сохраняем ответ в кеш
-        print("\n[Шаг 3] Сохранение ответа в кеш...")
+        # Step 3: Save answer to cache
+        print("\n[Step 3] Saving answer to cache...")
         cache.set(query, answer)
         
-        # Выводим финальный ответ
-        print("\n💡 ОТВЕТ:")
+        # Calculate elapsed time
+        elapsed = time.time() - start_time
+        print(f"\n[TIME] Total response time: {elapsed:.3f} seconds")
+        
+        # Print final answer
+        print("\n[ANSWER]:")
         print("-" * 70)
         print(answer)
         print("-" * 70)
@@ -130,137 +143,135 @@ def answer_question(query: str, rag_assistant: RAGAssistant, cache: ResponseCach
         return answer
         
     except Exception as e:
-        error_msg = f"Ошибка при обработке запроса: {str(e)}"
-        print(f"\n❌ {error_msg}")
+        error_msg = f"Error processing request: {str(e)}"
+        print(f"\n[ERROR] {error_msg}")
         return error_msg
 
 
 def interactive_mode(rag_assistant: RAGAssistant, cache: ResponseCache):
     """
-    Интерактивный режим общения с ассистентом.
+    Interactive chat mode with assistant.
     
-    Пользователь может задавать вопросы в цикле до тех пор,
-    пока не введет команду выхода.
+    User can ask questions in loop until exit command.
     """
     print("\n" + "=" * 70)
-    print("💬 ИНТЕРАКТИВНЫЙ РЕЖИМ")
+    print("[CHAT] INTERACTIVE MODE")
     print("=" * 70)
-    print("\nВы можете задавать вопросы ассистенту.")
-    print("Для выхода введите: exit, quit, выход или q")
-    print("\nДоступные команды:")
-    print("  • cache - показать информацию о кеше")
-    print("  • clear_cache - очистить кеш")
-    print("  • stats - показать статистику системы")
+    print("\nYou can ask questions to the assistant.")
+    print("To exit enter: exit, quit, or q")
+    print("\nAvailable commands:")
+    print("  - cache - show cache info")
+    print("  - clear_cache - clear cache")
+    print("  - stats - show system statistics")
     print()
     
     while True:
         try:
-            # Получаем ввод от пользователя
-            user_input = input("\n👤 Вы: ").strip()
+            # Get user input
+            user_input = input("\n[YOU]: ").strip()
             
-            # Проверяем команды выхода
-            if user_input.lower() in ['exit', 'quit', 'выход', 'q', '']:
-                print("\n👋 До свидания!")
+            # Check exit commands
+            if user_input.lower() in ['exit', 'quit', 'q', '']:
+                print("\n[BYE] Goodbye!")
                 break
             
-            # Обрабатываем специальные команды
+            # Handle special commands
             if user_input.lower() == 'cache':
-                print(f"\n📊 Кеш содержит {cache.size()} записей")
+                print(f"\n[STATS] Cache contains {cache.size()} entries")
                 continue
             
             if user_input.lower() == 'clear_cache':
                 cache.clear()
-                print("\n✓ Кеш очищен")
+                print("\n[OK] Cache cleared")
                 continue
             
             if user_input.lower() == 'stats':
-                print(f"\n📊 СТАТИСТИКА СИСТЕМЫ:")
-                print(f"  • Документов в ChromaDB: {rag_assistant.embedding_store.collection.count()}")
-                print(f"  • Записей в кеше: {cache.size()}")
-                print(f"  • Модель LLM: {rag_assistant.model}")
+                print(f"\n[STATS] SYSTEM STATISTICS:")
+                print(f"  - Documents in FAISS: {rag_assistant.embedding_store.ntotal}")
+                print(f"  - Cache entries: {cache.size()}")
+                print(f"  - LLM model: {rag_assistant.model}")
                 continue
             
-            # Обрабатываем вопрос пользователя
+            # Handle user question
             answer_question(user_input, rag_assistant, cache)
             
         except KeyboardInterrupt:
-            print("\n\n👋 Прервано пользователем. До свидания!")
+            print("\n\n[BYE] Interrupted by user. Goodbye!")
             break
         except Exception as e:
-            print(f"\n❌ Ошибка: {str(e)}")
+            print(f"\n[ERROR] {str(e)}")
 
 
 def demo_mode(rag_assistant: RAGAssistant, cache: ResponseCache):
     """
-    Демонстрационный режим с заранее заготовленными вопросами.
+    Demo mode with predefined questions.
     
-    Показывает работу системы на примерах, включая использование кеша.
+    Shows system working on examples, including cache usage.
     """
     print("\n" + "=" * 70)
-    print("🎬 ДЕМОНСТРАЦИОННЫЙ РЕЖИМ")
+    print("[DEMO] DEMONSTRATION MODE")
     print("=" * 70)
-    print("\nСейчас будет продемонстрирована работа RAG-ассистента")
-    print("на нескольких примерах вопросов.\n")
+    print("\nNow RAG-assistant will be demonstrated")
+    print("on several example questions.\n")
     
-    # Список демо-вопросов
+    # Demo questions
     demo_questions = [
-        "Что такое Python и для чего он используется?",
-        "Расскажи про RAG и как он работает",
-        "Что такое векторные базы данных?",
-        "Что такое Python и для чего он используется?"  # Повторный вопрос для демонстрации кеша
+        "What is Python and what is it used for?",
+        "Tell me about RAG and how it works",
+        "What are vector databases?",
+        "What is Python and what is it used for?"  # Repeat for cache demo
     ]
     
     for i, question in enumerate(demo_questions, 1):
         print(f"\n\n{'#' * 70}")
-        print(f"ВОПРОС {i} из {len(demo_questions)}")
+        print(f"QUESTION {i} of {len(demo_questions)}")
         print(f"{'#' * 70}")
         
         answer_question(question, rag_assistant, cache)
         
-        # Пауза между вопросами (кроме последнего)
+        # Pause between questions (except last)
         if i < len(demo_questions):
-            input("\n[Нажмите Enter для следующего вопроса...]")
+            input("\n[Press Enter for next question...]")
     
     print("\n\n" + "=" * 70)
-    print("✅ ДЕМОНСТРАЦИЯ ЗАВЕРШЕНА")
+    print("[OK] DEMONSTRATION COMPLETE")
     print("=" * 70)
 
 
 def main():
     """
-    Главная функция приложения.
+    Main application function.
     """
     try:
-        # Инициализируем систему
+        # Initialize system
         embedding_store, rag_assistant, cache = initialize_system()
         
-        # Выбор режима работы
+        # Mode selection
         print("\n" + "=" * 70)
-        print("ВЫБОР РЕЖИМА РАБОТЫ")
+        print("MODE SELECTION")
         print("=" * 70)
-        print("\n1. Интерактивный режим - задавайте свои вопросы")
-        print("2. Демонстрационный режим - готовые примеры вопросов")
+        print("\n1. Interactive mode - ask your own questions")
+        print("2. Demo mode - ready-made example questions")
         print()
         
-        mode = input("Выберите режим (1 или 2, по умолчанию 1): ").strip()
+        mode = input("Select mode (1 or 2, default 1): ").strip()
         
         if mode == '2':
             demo_mode(rag_assistant, cache)
             
-            # Предложить перейти в интерактивный режим
+            # Offer to switch to interactive mode
             print("\n" + "=" * 70)
-            continue_interactive = input("\nПерейти в интерактивный режим? (y/n): ").strip().lower()
-            if continue_interactive in ['y', 'yes', 'д', 'да', '']:
+            continue_interactive = input("\nSwitch to interactive mode? (y/n): ").strip().lower()
+            if continue_interactive in ['y', 'yes', '']:
                 interactive_mode(rag_assistant, cache)
         else:
             interactive_mode(rag_assistant, cache)
         
     except Exception as e:
-        print(f"\n❌ Критическая ошибка: {str(e)}")
+        print(f"\n[ERROR] Critical error: {str(e)}")
         import traceback
         traceback.print_exc()
 
 
 if __name__ == "__main__":
     main()
-
